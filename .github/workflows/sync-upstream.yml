@@ -1,0 +1,32 @@
+name: Sync upstream
+
+on:
+  schedule:
+    # Every Monday at 02:00 UTC, which is Monday 10:00 in China time.
+    - cron: "0 2 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-upstream-main
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    name: Sync fork with upstream
+    runs-on: ubuntu-latest
+    steps:
+      - name: Sync main branch
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          BRANCH: main
+        run: |
+          set -euo pipefail
+          echo "Syncing ${REPO}:${BRANCH} with its upstream repository..."
+          gh api \
+            --method POST \
+            "repos/${REPO}/merge-upstream" \
+            -f branch="${BRANCH}"
