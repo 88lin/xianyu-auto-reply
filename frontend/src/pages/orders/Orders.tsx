@@ -54,6 +54,7 @@ const statusMap: Record<string, { label: string; class: string }> = {
   shipped: { label: '已发货', class: 'badge-success' },
   completed: { label: '已完成', class: 'badge-success' },
   refunding: { label: '退款中', class: 'badge-warning' },
+  refunded: { label: '已退款', class: 'badge-danger' },
   cancelled: { label: '已关闭', class: 'badge-danger' },
   unknown: { label: '未知', class: 'badge-gray' },
 }
@@ -480,6 +481,7 @@ export function Orders() {
                     { value: 'shipped', label: '已发货' },
                     { value: 'completed', label: '已完成' },
                     { value: 'refunding', label: '退款中' },
+                    { value: 'refunded', label: '已退款' },
                     { value: 'cancelled', label: '已关闭' },
                   ]}
                   placeholder="所有状态"
@@ -510,6 +512,7 @@ export function Orders() {
                   <option value="success">发送成功</option>
                   <option value="failed">发送失败</option>
                   <option value="unknown">待确认</option>
+                  <option value="timeout">超时</option>
                 </select>
               </div>
               <div className="input-group">
@@ -700,10 +703,12 @@ export function Orders() {
                                     <span className={
                                       order.delivery_send_status === 'success' ? 'badge-success' :
                                       order.delivery_send_status === 'failed' ? 'badge-danger' :
+                                      order.delivery_send_status === 'timeout' ? 'badge-warning' :
                                       'badge-gray'
                                     }>
                                       {order.delivery_send_status === 'success' ? '发送成功' :
                                        order.delivery_send_status === 'failed' ? '发送失败' :
+                                       order.delivery_send_status === 'timeout' ? '超时' :
                                        '待确认'}
                                     </span>
                                     {order.delivery_send_fail_reason ? (
@@ -1052,10 +1057,12 @@ export function Orders() {
                           <span className={
                             orderDetail.delivery_send_status === 'success' ? 'badge-success' :
                             orderDetail.delivery_send_status === 'failed' ? 'badge-danger' :
+                            orderDetail.delivery_send_status === 'timeout' ? 'badge-warning' :
                             'badge-gray'
                           }>
                             {orderDetail.delivery_send_status === 'success' ? '发送成功' :
                              orderDetail.delivery_send_status === 'failed' ? '发送失败' :
+                             orderDetail.delivery_send_status === 'timeout' ? '超时' :
                              '待确认'}
                           </span>
                         </div>

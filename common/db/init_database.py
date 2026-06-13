@@ -255,6 +255,13 @@ class DatabaseInitializer:
             True,
             "定时备份数据库所有表结构与数据到文件",
         ),
+        (
+            "delivery_timeout",
+            "发货超时检测任务",
+            60,
+            True,
+            "定时将超过阈值仍处于 unknown 的自动发货消息日志标记为 timeout",
+        ),
     )
     
     # ========== 所有数据表的DDL定义 ==========
@@ -951,6 +958,7 @@ class DatabaseInitializer:
                 delivery_count INT NOT NULL DEFAULT 0 COMMENT '发货次数',
                 status TINYINT(1) DEFAULT 1 COMMENT '对接状态：1启用 0停用',
                 disable_reason VARCHAR(255) DEFAULT NULL COMMENT '禁用原因',
+                owner_disabled TINYINT(1) NOT NULL DEFAULT 0 COMMENT '是否被上级禁用锁定：1是 0否',
                 level INT NOT NULL DEFAULT 1 COMMENT '分销层级：1=一级分销，2=二级分销',
                 parent_dock_id BIGINT DEFAULT NULL COMMENT '上级对接记录ID，一级分销为NULL',
                 source_user_id BIGINT DEFAULT NULL COMMENT '上级分销商用户ID，一级分销为NULL',
@@ -1217,7 +1225,7 @@ class DatabaseInitializer:
                 reply_image_url VARCHAR(1000) DEFAULT NULL COMMENT '回复图片URL',
                 reply_segments JSON DEFAULT NULL COMMENT '拆分后的回复分段',
                 error_message TEXT COMMENT '错误信息',
-                send_status VARCHAR(20) NOT NULL DEFAULT 'unknown' COMMENT '发送状态：success-发送成功/failed-发送失败/unknown-未知(无响应)',
+                send_status VARCHAR(20) NOT NULL DEFAULT 'unknown' COMMENT '发送状态：success-发送成功/failed-发送失败/unknown-未知(无响应)/timeout-超时(无响应超过阈值)',
                 send_fail_reason TEXT COMMENT '发送失败原因（如被安全拦截的明文文案）',
                 raw_message_json JSON DEFAULT NULL COMMENT '原始消息JSON',
                 context_snapshot JSON DEFAULT NULL COMMENT '上下文快照',
@@ -1241,7 +1249,8 @@ class DatabaseInitializer:
                 INDEX idx_arml_owner_status_created (owner_id, process_status, created_at),
                 INDEX idx_arml_status_created (process_status, created_at),
                 INDEX idx_arml_status_strategy_created (process_status, reply_strategy, created_at),
-                INDEX idx_arml_strategy_created (reply_strategy, created_at)
+                INDEX idx_arml_strategy_created (reply_strategy, created_at),
+                INDEX idx_arml_order_strategy_id (order_no, reply_strategy, id)
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='自动回复消息日志表';
         """,
 
@@ -1405,7 +1414,7 @@ class DatabaseInitializer:
     # 字段迁移定义：表名 -> [(字段名, 字段定义, 在哪个字段后面)]
     COLUMN_MIGRATIONS = {
         "xy_auto_reply_message_logs": [
-            ("send_status", "VARCHAR(20) NOT NULL DEFAULT 'unknown' COMMENT '发送状态：success-发送成功/failed-发送失败/unknown-未知(无响应)'", "error_message"),
+            ("send_status", "VARCHAR(20) NOT NULL DEFAULT 'unknown' COMMENT '发送状态：success-发送成功/failed-发送失败/unknown-未知(无响应)/timeout-超时(无响应超过阈值)'", "error_message"),
             ("send_fail_reason", "TEXT COMMENT '发送失败原因（如被安全拦截的明文文案）'", "send_status"),
             ("order_no", "VARCHAR(64) DEFAULT NULL COMMENT '订单号（自动发货等场景关联订单）'", "item_title"),
         ],
@@ -1460,6 +1469,7 @@ class DatabaseInitializer:
         "xy_dock_records": [
             ("delivery_count", "INT NOT NULL DEFAULT 0 COMMENT '发货次数'", "remark"),
             ("disable_reason", "VARCHAR(255) DEFAULT NULL COMMENT '禁用原因'", "status"),
+            ("owner_disabled", "TINYINT(1) NOT NULL DEFAULT 0 COMMENT '是否被上级禁用锁定：1是 0否'", "disable_reason"),
             ("level", "INT NOT NULL DEFAULT 1 COMMENT '分销层级：1=一级分销，2=二级分销'", "disable_reason"),
             ("parent_dock_id", "BIGINT DEFAULT NULL COMMENT '上级对接记录ID，一级分销为NULL'", "level"),
             ("source_user_id", "BIGINT DEFAULT NULL COMMENT '上级分销商用户ID，一级分销为NULL'", "parent_dock_id"),
@@ -2567,6 +2577,24 @@ class DatabaseInitializer:
                         logger.info("✓ xy_auto_reply_message_logs: 创建 idx_order_no 索引")
                 except Exception as e:
                     logger.warning(f"✗ xy_auto_reply_message_logs idx_order_no 创建失败: {e}")
+
+                # 补建 (order_no, reply_strategy, id) 复合索引 —— 加速「按订单号+回复策略取最新一条日志」的查询
+                # （订单列表关联自动发货发送状态：WHERE reply_strategy='auto_delivery' AND order_no IN (...) GROUP BY order_no, MAX(id)）
+                try:
+                    check = text("""
+                        SELECT COUNT(*) FROM information_schema.STATISTICS
+                        WHERE TABLE_SCHEMA = DATABASE()
+                        AND TABLE_NAME = 'xy_auto_reply_message_logs'
+                        AND INDEX_NAME = 'idx_arml_order_strategy_id'
+                    """)
+                    result = await conn.execute(check)
+                    if result.scalar() == 0:
+                        await conn.execute(text(
+                            "ALTER TABLE xy_auto_reply_message_logs ADD INDEX idx_arml_order_strategy_id (order_no, reply_strategy, id)"
+                        ))
+                        logger.info("✓ xy_auto_reply_message_logs: 创建 idx_arml_order_strategy_id 复合索引")
+                except Exception as e:
+                    logger.warning(f"✗ xy_auto_reply_message_logs idx_arml_order_strategy_id 创建失败: {e}")
 
             # 为 xy_dock_records 补建 (source_user_id, level) 复合索引 —— 加速二级分销商列表查询
             try:
