@@ -79,6 +79,20 @@ class ListingMonitorBatchDeleteRequest(BaseModel):
     ids: List[int] = Field(default_factory=list, description="监控任务ID列表")
 
 
+class ListingMonitorBatchAccountsRequest(BaseModel):
+    """批量修改上新监控任务账号请求"""
+
+    ids: List[int] = Field(default_factory=list, description="监控任务ID列表")
+    field: str = Field(..., description="要修改的账号字段：account_ids-监控账号，order_account_ids-下单账号")
+    account_ids: List[str] = Field(default_factory=list, description="选择的账号ID列表")
+
+
+class ListingMonitorCopyCookiesRequest(BaseModel):
+    """复制监控日志账号Cookies请求"""
+
+    ids: List[int] = Field(default_factory=list, description="监控日志ID列表")
+
+
 @router.get("", response_model=ApiResponse)
 async def list_listing_monitor_tasks(
     page: int = Query(1, ge=1, description="页码"),
@@ -212,6 +226,27 @@ async def batch_delete_listing_monitor_tasks(
     )
 
 
+@router.post("/batch-update-accounts", response_model=ApiResponse)
+async def batch_update_listing_monitor_accounts(
+    req: ListingMonitorBatchAccountsRequest,
+    current_user: User = Depends(get_current_active_user),
+    session: AsyncSession = Depends(get_db_session),
+) -> Dict[str, Any]:
+    """批量修改监控任务的监控账号或下单账号"""
+    owner_id, _ = resolve_owner_scope(current_user)
+    svc = ListingMonitorService(session)
+    try:
+        success_count = await svc.batch_update_accounts(owner_id, req.ids, req.field, req.account_ids)
+    except ValueError as exc:
+        return ApiResponse(success=False, message=str(exc))
+    field_label = "监控账号" if req.field == "account_ids" else "下单账号"
+    return ApiResponse(
+        success=True,
+        message=f"成功为 {success_count} 条监控任务修改{field_label}",
+        data={"success_count": success_count, "total_count": len(req.ids)},
+    )
+
+
 @router.get("/options", response_model=ApiResponse)
 async def list_listing_monitor_task_options(
     current_user: User = Depends(get_current_active_user),
@@ -248,6 +283,22 @@ async def list_listing_monitor_logs(
     return ApiResponse(success=True, message="查询成功", data=data)
 
 
+@router.post("/logs/copy-cookies", response_model=ApiResponse)
+async def copy_listing_monitor_log_cookies(
+    req: ListingMonitorCopyCookiesRequest,
+    current_user: User = Depends(get_current_active_user),
+    session: AsyncSession = Depends(get_db_session),
+) -> Dict[str, Any]:
+    """汇总选中监控日志涉及的账号（去重），返回账号ID/Cookie/分销秘钥，供前端复制为JSON"""
+    owner_id, _ = resolve_owner_scope(current_user)
+    svc = ListingMonitorService(session)
+    try:
+        data = await svc.collect_log_account_cookies(owner_id, req.ids)
+    except ValueError as exc:
+        return ApiResponse(success=False, message=str(exc))
+    return ApiResponse(success=True, message="查询成功", data={"list": data})
+
+
 @router.get("/items", response_model=ApiResponse)
 async def list_listing_monitor_items(
     page: int = Query(1, ge=1, description="页码"),
@@ -261,6 +312,10 @@ async def list_listing_monitor_items(
     is_ordered: Optional[bool] = Query(None, description="是否已下单"),
     seller_fill: Optional[str] = Query(None, description="卖家补全状态：filled/pending/failed"),
     has_detail: Optional[bool] = Query(None, description="是否已获取详情"),
+    dm_state: Optional[str] = Query(None, description="私信状态：not_sent/pending/success/failed"),
+    order_state: Optional[str] = Query(None, description="下单状态：not_ordered/ordered/failed/no_account/duplicate"),
+    created_start: Optional[str] = Query(None, description="采集时间区间开始（北京时间，如 2026-06-18T00:00）"),
+    created_end: Optional[str] = Query(None, description="采集时间区间结束（北京时间，如 2026-06-18T23:59）"),
     current_user: User = Depends(get_current_active_user),
     session: AsyncSession = Depends(get_db_session),
 ) -> Dict[str, Any]:
@@ -280,6 +335,10 @@ async def list_listing_monitor_items(
         is_ordered=is_ordered,
         seller_fill=seller_fill,
         has_detail=has_detail,
+        dm_state=dm_state,
+        order_state=order_state,
+        created_start=created_start,
+        created_end=created_end,
     )
     return ApiResponse(success=True, message="查询成功", data=data)
 

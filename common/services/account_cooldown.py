@@ -2,9 +2,9 @@
 账号风控冷却管理（进程内内存态）
 
 功能：
-1. 记录因触发风控（被挤爆/验证/punish 等）的账号，进入冷却期（默认 10 分钟）
+1. 记录因触发风控（被挤爆/验证/punish 等）的账号，进入冷却期（默认 20 分钟）
 2. 采集等定时任务轮询账号时，过滤掉处于冷却期的账号
-3. 当所有账号都在冷却期时，提供"最先进入冷却（最接近冷却结束）"的账号兜底使用
+3. 当所有账号都在冷却期时，调用方可据此跳过本次采集并记录失败原因
 
 说明：
 - 冷却状态仅保存在 scheduler 进程内存中（重启后清空），用于短时风控规避，不入库。
@@ -28,8 +28,8 @@ _RISK_MARKERS = (
     "validate",
 )
 
-# 默认冷却时长（秒）：被挤爆/触发验证后 10 分钟内不再使用该账号
-DEFAULT_COOLDOWN_SECONDS = 600
+# 默认冷却时长（秒）：被挤爆/触发验证后 20 分钟内不再使用该账号
+DEFAULT_COOLDOWN_SECONDS = 1200
 
 
 class AccountCooldownManager:
@@ -65,20 +65,6 @@ class AccountCooldownManager:
         now = time.time()
         with self._lock:
             return [aid for aid in account_ids if self._cooldowns.get(str(aid), 0.0) <= now]
-
-    def earliest_cooling(self, account_ids: Sequence[str]) -> Optional[str]:
-        """所有账号都在冷却时，返回最先进入冷却（冷却结束时间最小）的账号ID。
-
-        冷却时长固定，故"最先进入冷却"等价于"冷却结束时间最早"。
-        """
-        with self._lock:
-            candidates = [
-                (aid, self._cooldowns.get(str(aid), 0.0)) for aid in account_ids
-            ]
-        candidates = [(aid, until) for aid, until in candidates if until > 0]
-        if not candidates:
-            return None
-        return min(candidates, key=lambda x: x[1])[0]
 
 
 # 全局单例（scheduler 进程内共享）

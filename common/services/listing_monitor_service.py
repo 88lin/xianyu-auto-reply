@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime
 from decimal import Decimal, InvalidOperation
 from typing import Any, Dict, List, Optional, Sequence
 
@@ -37,6 +38,26 @@ def _to_decimal(value: Any) -> Optional[Decimal]:
         return Decimal(str(value)).quantize(Decimal("0.01"))
     except (InvalidOperation, ValueError, TypeError):
         raise ValueError("价格格式不正确")
+
+
+def _parse_naive_datetime(value: Optional[str]) -> Optional[datetime]:
+    """将前端传入的时间字符串解析为 naive 北京时间，用于采集时间区间过滤。
+
+    兼容 "2026-06-18T22:36"、"2026-06-18T22:36:00"、"2026-06-18 22:36:00" 等格式；
+    解析失败或空值返回 None（即不施加该边界条件）。
+    """
+    if not value:
+        return None
+    raw = value.strip()
+    if not raw:
+        return None
+    normalized = raw.replace("T", " ")
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(normalized, fmt)
+        except ValueError:
+            continue
+    return None
 
 
 def _safe_json_loads(text: Optional[str]) -> Any:
@@ -96,11 +117,15 @@ def _log_to_dict(log: ListingMonitorLog) -> Dict[str, Any]:
     }
 
 
-def _item_to_dict(item: ListingMonitorItem) -> Dict[str, Any]:
-    """将采集商品模型转换为前端可用的字典。"""
+def _item_to_dict(item: ListingMonitorItem, task_keyword: Optional[str] = None) -> Dict[str, Any]:
+    """将采集商品模型转换为前端可用的字典。
+
+    task_keyword: 所属监控任务的关键字（任务名称），由调用方批量查出后传入。
+    """
     return {
         "id": item.id,
         "monitor_task_id": item.monitor_task_id,
+        "monitor_task_keyword": task_keyword,
         "item_id": item.item_id,
         "title": item.title,
         "price": item.price,
@@ -427,13 +452,13 @@ class ListingMonitorService:
                 select(distinct_item).where(*_item_cond())
             )
         ).scalar() or 0
-        # 今日采集数（去重）：今日被采集到（last_seen_at 在今日）
+        # 今日采集数（去重）：今日被采集到（last_seen_at），包含重复采集的商品
         today_collected = (
             await self.session.execute(
                 select(distinct_item).where(*_item_cond([ListingMonitorItem.last_seen_at >= today_start]))
             )
         ).scalar() or 0
-        # 今日新增商品数（去重）：今日首次入库
+        # 今日新增商品数（去重）：今日首次入库（created_at），不包含重复采集
         today_new = (
             await self.session.execute(
                 select(distinct_item).where(*_item_cond([ListingMonitorItem.created_at >= today_start]))
@@ -449,6 +474,28 @@ class ListingMonitorService:
         today_ordered = (
             await self.session.execute(
                 select(distinct_item).where(*_item_cond([ListingMonitorItem.ordered_at >= today_start]))
+            )
+        ).scalar() or 0
+        # 今日下单失败数（去重）：今日入库（created_at 在今日）且下单结果为失败
+        today_order_failed = (
+            await self.session.execute(
+                select(distinct_item).where(
+                    *_item_cond([
+                        ListingMonitorItem.created_at >= today_start,
+                        ListingMonitorItem.order_status == "failed",
+                    ])
+                )
+            )
+        ).scalar() or 0
+        # 今日重复跳过数（去重）：今日入库（created_at 在今日）且下单结果为重复跳过
+        today_order_duplicate = (
+            await self.session.execute(
+                select(distinct_item).where(
+                    *_item_cond([
+                        ListingMonitorItem.created_at >= today_start,
+                        ListingMonitorItem.order_status == "duplicate",
+                    ])
+                )
             )
         ).scalar() or 0
         # 累计私信成功数（去重，按实际发起私信时间，排除直接下单跳过私信的商品）
@@ -476,6 +523,8 @@ class ListingMonitorService:
             "today_new": int(today_new),
             "today_dm": int(today_dm),
             "today_ordered": int(today_ordered),
+            "today_order_failed": int(today_order_failed),
+            "today_order_duplicate": int(today_order_duplicate),
             "total_items": int(total_items),
             "total_dm": int(total_dm),
             "total_ordered": int(total_ordered),
@@ -622,6 +671,157 @@ class ListingMonitorService:
         await self.session.commit()
         return len(tasks)
 
+    async def batch_update_accounts(
+        self,
+        owner_id: Optional[int],
+        task_ids: Sequence[int],
+        field: str,
+        account_ids: Any,
+    ) -> int:
+        """批量修改监控任务的账号字段（监控账号 account_ids 或下单账号 order_account_ids）。
+
+        Args:
+            field: 仅允许 "account_ids"（监控/采集账号）或 "order_account_ids"（下单账号）
+            account_ids: 选择的账号ID列表（会校验归属，普通用户只能选自己的账号）
+
+        Returns: 实际更新的任务数
+        """
+        if field not in ("account_ids", "order_account_ids"):
+            raise ValueError("不支持的批量修改字段")
+
+        normalized_ids: List[int] = []
+        for raw_id in task_ids:
+            try:
+                task_id = int(raw_id)
+            except (TypeError, ValueError):
+                continue
+            if task_id > 0 and task_id not in normalized_ids:
+                normalized_ids.append(task_id)
+        if not normalized_ids:
+            raise ValueError("请选择要修改的监控任务")
+
+        valid_account_ids = await self._normalize_account_ids(owner_id, account_ids)
+        if not valid_account_ids:
+            label = "监控账号" if field == "account_ids" else "下单账号"
+            raise ValueError(f"请至少选择一个{label}")
+
+        conditions = self._scope_conditions(owner_id)
+        conditions.append(ListingMonitorTask.id.in_(normalized_ids))
+        stmt = select(ListingMonitorTask).where(*conditions)
+        tasks = (await self.session.execute(stmt)).scalars().all()
+        now = get_beijing_now_naive()
+        for task in tasks:
+            setattr(task, field, valid_account_ids)
+            task.updated_at = now
+
+        await self.session.commit()
+        return len(tasks)
+
+    async def collect_log_account_cookies(
+        self,
+        owner_id: Optional[int],
+        log_ids: Sequence[int],
+    ) -> List[Dict[str, Any]]:
+        """根据监控日志ID集合，汇总去重后的账号信息（账号ID、Cookie、分销秘钥），用于复制。
+
+        - 账号来源：每条日志关联的监控任务(monitor_task_id) 所配置的账号列表(account_ids)；
+          即"根据日志找到监控任务，再取任务里配置的采集账号"，而非日志实际执行时用到的账号
+          （失败的执行可能没有记录实际账号）。
+        - 多条日志可能关联同一任务，按 account_id 去重（保留首次出现顺序）；
+        - 分销秘钥：取该账号所属用户(owner)的 secret_key（个人设置-分销模块），一个账号一条。
+
+        Returns: [{"account_id": str, "cookies": str, "secret_key": str}, ...]
+        """
+        normalized_ids: List[int] = []
+        for raw_id in log_ids:
+            try:
+                log_id = int(raw_id)
+            except (TypeError, ValueError):
+                continue
+            if log_id > 0 and log_id not in normalized_ids:
+                normalized_ids.append(log_id)
+        if not normalized_ids:
+            raise ValueError("请选择要复制的监控日志")
+
+        # 1) 由日志找到其关联的监控任务ID（按日志ID顺序保留任务首次出现顺序）
+        log_conditions = [ListingMonitorLog.id.in_(normalized_ids)]
+        if owner_id is not None:
+            log_conditions.append(ListingMonitorLog.owner_id == owner_id)
+        log_rows = (
+            await self.session.execute(
+                select(ListingMonitorLog.id, ListingMonitorLog.monitor_task_id)
+                .where(*log_conditions)
+                .order_by(ListingMonitorLog.id.desc())
+            )
+        ).all()
+
+        ordered_task_ids: List[int] = []
+        seen_task: set[int] = set()
+        for _log_id, task_id in log_rows:
+            if task_id and task_id not in seen_task:
+                seen_task.add(task_id)
+                ordered_task_ids.append(task_id)
+        if not ordered_task_ids:
+            return []
+
+        # 2) 取这些监控任务配置的账号ID列表(account_ids)，去重保序
+        task_conditions = [ListingMonitorTask.id.in_(ordered_task_ids)]
+        if owner_id is not None:
+            task_conditions.append(ListingMonitorTask.owner_id == owner_id)
+        task_rows = (
+            await self.session.execute(
+                select(ListingMonitorTask.id, ListingMonitorTask.account_ids).where(*task_conditions)
+            )
+        ).all()
+        task_account_map = {tid: (acc_ids or []) for tid, acc_ids in task_rows}
+
+        ordered_account_ids: List[str] = []
+        seen: set[str] = set()
+        for task_id in ordered_task_ids:
+            for aid in list(task_account_map.get(task_id) or []):
+                if not aid:
+                    continue
+                aid = str(aid)
+                if aid not in seen:
+                    seen.add(aid)
+                    ordered_account_ids.append(aid)
+        if not ordered_account_ids:
+            return []
+
+        # 查询账号 Cookie（普通用户仅限本人账号，管理员不限）
+        acc_conditions = [XYAccount.account_id.in_(ordered_account_ids)]
+        if owner_id is not None:
+            acc_conditions.append(XYAccount.owner_id == owner_id)
+        acc_rows = list(
+            (await self.session.execute(select(XYAccount).where(*acc_conditions))).scalars().all()
+        )
+        acc_map = {acc.account_id: acc for acc in acc_rows}
+
+        # 查询各账号所属用户的分销秘钥
+        owner_ids = {acc.owner_id for acc in acc_rows if acc.owner_id is not None}
+        secret_map: Dict[int, Optional[str]] = {}
+        if owner_ids:
+            for uid, secret_key in (
+                await self.session.execute(
+                    select(User.id, User.secret_key).where(User.id.in_(owner_ids))
+                )
+            ).all():
+                secret_map[uid] = secret_key
+
+        result: List[Dict[str, Any]] = []
+        for aid in ordered_account_ids:
+            acc = acc_map.get(aid)
+            if not acc:
+                continue
+            result.append(
+                {
+                    "account_id": acc.account_id,
+                    "cookies": acc.cookie or "",
+                    "secret_key": secret_map.get(acc.owner_id) or "",
+                }
+            )
+        return result
+
     async def list_task_options(self, owner_id: Optional[int]) -> List[Dict[str, Any]]:
         """查询监控任务下拉选项（用于日志/采集商品页按任务筛选）。"""
         conditions = self._scope_conditions(owner_id)
@@ -690,6 +890,10 @@ class ListingMonitorService:
         is_ordered: Optional[bool] = None,
         seller_fill: Optional[str] = None,
         has_detail: Optional[bool] = None,
+        dm_state: Optional[str] = None,
+        order_state: Optional[str] = None,
+        created_start: Optional[str] = None,
+        created_end: Optional[str] = None,
     ) -> Dict[str, Any]:
         """分页查询采集商品信息。"""
         page = max(page, 1)
@@ -708,10 +912,61 @@ class ListingMonitorService:
             conditions.append(ListingMonitorItem.seller_nick.like(f"%{seller_nick.strip()}%"))
         if item_id:
             conditions.append(ListingMonitorItem.item_id == item_id.strip())
-        if is_dm_sent is not None:
+        # 私信状态（优先使用 dm_state 多状态筛选；未传时回退旧的 is_dm_sent 布尔筛选）
+        # 状态语义与列表展示保持一致：
+        #   not_sent-未私信 / pending-已发待确认 / success-私信成功 / failed-私信失败
+        if dm_state == "not_sent":
+            conditions.append(ListingMonitorItem.is_dm_sent.is_(False))
+            conditions.append(
+                or_(
+                    ListingMonitorItem.dm_status.is_(None),
+                    ListingMonitorItem.dm_status != "failed",
+                )
+            )
+        elif dm_state == "success":
+            conditions.append(ListingMonitorItem.dm_status == "success")
+        elif dm_state == "failed":
+            conditions.append(ListingMonitorItem.dm_status == "failed")
+        elif dm_state == "pending":
+            conditions.append(ListingMonitorItem.is_dm_sent.is_(True))
+            conditions.append(
+                or_(
+                    ListingMonitorItem.dm_status.is_(None),
+                    ListingMonitorItem.dm_status.notin_(["success", "failed"]),
+                )
+            )
+        elif is_dm_sent is not None:
             conditions.append(ListingMonitorItem.is_dm_sent.is_(is_dm_sent))
-        if is_ordered is not None:
+        # 下单状态（优先使用 order_state 多状态筛选；未传时回退旧的 is_ordered 布尔筛选）
+        # 状态语义与列表展示保持一致：
+        #   not_ordered-未下单 / ordered-已下单 / failed-下单失败 / no_account-无可用账号 / duplicate-重复跳过
+        if order_state == "ordered":
+            conditions.append(ListingMonitorItem.is_ordered.is_(True))
+        elif order_state == "duplicate":
+            conditions.append(ListingMonitorItem.order_status == "duplicate")
+        elif order_state == "no_account":
+            conditions.append(ListingMonitorItem.is_ordered.is_(False))
+            conditions.append(ListingMonitorItem.order_status == "no_account")
+        elif order_state == "failed":
+            conditions.append(ListingMonitorItem.is_ordered.is_(False))
+            conditions.append(ListingMonitorItem.order_status == "failed")
+        elif order_state == "not_ordered":
+            conditions.append(ListingMonitorItem.is_ordered.is_(False))
+            conditions.append(
+                or_(
+                    ListingMonitorItem.order_status.is_(None),
+                    ListingMonitorItem.order_status.notin_(["duplicate", "no_account", "failed"]),
+                )
+            )
+        elif is_ordered is not None:
             conditions.append(ListingMonitorItem.is_ordered.is_(is_ordered))
+        # 采集时间区间（created_at，北京时间）
+        created_start_dt = _parse_naive_datetime(created_start)
+        if created_start_dt is not None:
+            conditions.append(ListingMonitorItem.created_at >= created_start_dt)
+        created_end_dt = _parse_naive_datetime(created_end)
+        if created_end_dt is not None:
+            conditions.append(ListingMonitorItem.created_at <= created_end_dt)
         if has_detail is not None:
             if has_detail:
                 conditions.append(ListingMonitorItem.detail_json.isnot(None))
@@ -749,8 +1004,20 @@ class ListingMonitorService:
         )
         rows = (await self.session.execute(stmt)).scalars().all()
 
+        # 批量查询本页商品所属监控任务的关键字（任务名称），用于前端展示
+        task_keyword_map: Dict[int, str] = {}
+        task_ids = {row.monitor_task_id for row in rows if row.monitor_task_id is not None}
+        if task_ids:
+            kw_stmt = select(ListingMonitorTask.id, ListingMonitorTask.keyword).where(
+                ListingMonitorTask.id.in_(task_ids)
+            )
+            for tid, kw in (await self.session.execute(kw_stmt)).all():
+                task_keyword_map[tid] = kw
+
         return {
-            "list": [_item_to_dict(row) for row in rows],
+            "list": [
+                _item_to_dict(row, task_keyword_map.get(row.monitor_task_id)) for row in rows
+            ],
             "total": total,
             "page": page,
             "page_size": page_size,
@@ -766,7 +1033,17 @@ class ListingMonitorService:
         item = (await self.session.execute(stmt)).scalar_one_or_none()
         if not item:
             return None
-        data = _item_to_dict(item)
+        # 查询所属监控任务关键字（任务名称）
+        task_keyword = None
+        if item.monitor_task_id is not None:
+            task_keyword = (
+                await self.session.execute(
+                    select(ListingMonitorTask.keyword).where(
+                        ListingMonitorTask.id == item.monitor_task_id
+                    )
+                )
+            ).scalar_one_or_none()
+        data = _item_to_dict(item, task_keyword)
         # 附带数据库中存储的原始详情与搜索原始数据（解析为对象，便于前端展示）
         data["detail_json"] = _safe_json_loads(item.detail_json)
         data["raw_json"] = _safe_json_loads(item.raw_json)

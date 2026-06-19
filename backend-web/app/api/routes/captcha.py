@@ -49,6 +49,9 @@ class SliderSolveRequest(BaseModel):
     account_id: str = ""                 # 外部账号标识（仅用于日志/浏览器实例隔离，本系统不查库）
     url: str                             # punish 验证链接（punish?x5secdata=...）
     browser_timeout: int = 40            # 单次浏览器超时（秒），范围 20~120
+    cookies: str = ""                    # 可选：账号 Cookie（调用方开启"传递Cookie"开关时传入），
+                                         # 用于链接过期时凭 Cookie 重取新链接继续处理
+    device_id: str = ""                  # 可选：设备 ID，配合 cookies 重新请求 token 接口使用
 
 
 class TestRemoteSolveRequest(BaseModel):
@@ -61,11 +64,13 @@ class RemoteConfigUpdate(BaseModel):
     """远程过滑块全局配置（仅管理员）"""
     url: str = ""
     secret_key: str = ""
+    pass_cookies: bool = False   # 是否在调用远程接口时传递账号 Cookie（默认关闭）
 
 
 # 远程过滑块全局配置存储 key（system_settings，全局唯一，仅管理员可读写）
 REMOTE_CONFIG_URL_KEY = "captcha.remote_service_url"
 REMOTE_CONFIG_SECRET_KEY = "captcha.remote_secret_key"
+REMOTE_CONFIG_PASS_COOKIES_KEY = "captcha.remote_pass_cookies"
 
 
 # ==================== 工具函数 ====================
@@ -75,6 +80,48 @@ def generate_captcha_text(length: int = 4) -> str:
     # 排除容易混淆的字符: 0, O, 1, I, l
     chars = "23456789ABCDEFGHJKLMNPQRSTUVWXYZ"
     return "".join(random.choices(chars, k=length))
+
+
+def _load_captcha_font(size: int = 28):
+    """
+    按候选路径加载验证码字体。
+
+    Why: Linux 容器（python:3.11-slim）默认没有 arial.ttf，原先直接
+    truetype("arial.ttf") 抛异常后 fallback 到 load_default() 的位图字体
+    极小（~10px），用户看到的验证码图片几乎是空白。
+    这里按优先级尝试各平台常见 TTF 路径，全部失败再退回默认字体。
+    """
+    from PIL import ImageFont
+    import os
+
+    # 全部使用绝对路径，避免 truetype 解析相对路径时抛异常拖慢生成
+    candidates = [
+        # Linux 容器（apt 安装 fonts-dejavu-core / fonts-liberation 后存在）
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+        # Windows 本地开发
+        "C:/Windows/Fonts/arial.ttf",
+        "C:/Windows/Fonts/arialbd.ttf",
+        # macOS
+        "/System/Library/Fonts/Helvetica.ttc",
+        "/Library/Fonts/Arial.ttf",
+    ]
+    for path in candidates:
+        if not os.path.exists(path):
+            continue
+        try:
+            return ImageFont.truetype(path, size)
+        except Exception:
+            continue
+
+    # 全部 TTF 都不可用时的兜底：Pillow 10+ 支持 load_default(size)
+    try:
+        return ImageFont.load_default(size=size)
+    except TypeError:
+        # 老版本 Pillow 不支持 size 参数，只能回退到默认小字体
+        return ImageFont.load_default()
 
 
 def generate_captcha_image(text: str) -> str:
@@ -116,10 +163,7 @@ def generate_captcha_image(text: str) -> str:
             )
         
         # 绘制文字
-        try:
-            font = ImageFont.truetype("arial.ttf", 28)
-        except Exception:
-            font = ImageFont.load_default()
+        font = _load_captcha_font(28)
         
         # 计算文字位置
         for i, char in enumerate(text):
@@ -447,6 +491,8 @@ async def slider_solve(
         browser_timeout=timeout,
         call_type="remote",
         call_user=user.username,
+        cookies=(request.cookies or "").strip(),
+        device_id=(request.device_id or "").strip(),
     )
 
     if isinstance(result_data, dict) and result_data.get("success"):
@@ -507,13 +553,18 @@ async def get_remote_config(
 
     rows = (await db.execute(
         select(SystemSetting).where(
-            SystemSetting.key.in_([REMOTE_CONFIG_URL_KEY, REMOTE_CONFIG_SECRET_KEY])
+            SystemSetting.key.in_([
+                REMOTE_CONFIG_URL_KEY,
+                REMOTE_CONFIG_SECRET_KEY,
+                REMOTE_CONFIG_PASS_COOKIES_KEY,
+            ])
         )
     )).scalars().all()
     m = {r.key: (r.value or "") for r in rows}
     return ApiResponse(success=True, data={
         "url": m.get(REMOTE_CONFIG_URL_KEY, ""),
         "secret_key": m.get(REMOTE_CONFIG_SECRET_KEY, ""),
+        "pass_cookies": (m.get(REMOTE_CONFIG_PASS_COOKIES_KEY, "") or "").strip().lower() == "true",
     })
 
 
@@ -529,4 +580,9 @@ async def update_remote_config(
     svc = SystemSettingService(db)
     await svc.set_setting(REMOTE_CONFIG_URL_KEY, (request.url or "").strip(), "远程过滑块服务URL")
     await svc.set_setting(REMOTE_CONFIG_SECRET_KEY, (request.secret_key or "").strip(), "远程过滑块秘钥")
+    await svc.set_setting(
+        REMOTE_CONFIG_PASS_COOKIES_KEY,
+        "true" if request.pass_cookies else "false",
+        "远程过滑块是否传递账号Cookie",
+    )
     return ApiResponse(success=True, message="保存成功")

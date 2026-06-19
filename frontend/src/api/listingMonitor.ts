@@ -67,6 +67,8 @@ export interface ListingMonitorOverview {
   today_new: number
   today_dm: number
   today_ordered: number
+  today_order_failed: number
+  today_order_duplicate: number
   total_items: number
   total_dm: number
   total_ordered: number
@@ -152,6 +154,29 @@ export const batchDeleteListingMonitorTasks = (
   return post(`${PREFIX}/batch-delete`, { ids: taskIds })
 }
 
+// 批量修改监控任务的账号（监控账号 account_ids 或下单账号 order_account_ids）
+export const batchUpdateListingMonitorAccounts = (
+  taskIds: number[],
+  field: 'account_ids' | 'order_account_ids',
+  accountIds: string[]
+): Promise<ApiResponse<ListingMonitorBatchDeleteResult>> => {
+  return post(`${PREFIX}/batch-update-accounts`, { ids: taskIds, field, account_ids: accountIds })
+}
+
+// 监控日志账号Cookie复制项
+export interface ListingMonitorLogCookieItem {
+  account_id: string
+  cookies: string
+  secret_key: string
+}
+
+// 复制选中监控日志涉及的账号Cookie（去重，返回账号ID/Cookie/分销秘钥）
+export const copyListingMonitorLogCookies = (
+  logIds: number[]
+): Promise<ApiResponse<{ list: ListingMonitorLogCookieItem[] }>> => {
+  return post(`${PREFIX}/logs/copy-cookies`, { ids: logIds })
+}
+
 // 手动执行单个监控任务采集（立即执行一次）
 export const runListingMonitorTask = (
   taskId: number
@@ -215,6 +240,7 @@ export const getListingMonitorLogs = (
 export interface ListingMonitorItem {
   id: number
   monitor_task_id: number
+  monitor_task_keyword?: string | null
   item_id: string
   title?: string | null
   price?: string | null
@@ -268,6 +294,10 @@ export const getListingMonitorItems = (
     isOrdered?: boolean
     sellerFill?: string
     hasDetail?: boolean
+    dmState?: string
+    orderState?: string
+    createdStart?: string
+    createdEnd?: string
   }
 ): Promise<ApiResponse<ListingMonitorItemListData>> => {
   const searchParams = new URLSearchParams({ page: String(page), page_size: String(pageSize) })
@@ -280,6 +310,10 @@ export const getListingMonitorItems = (
   if (params?.isOrdered !== undefined) searchParams.append('is_ordered', String(params.isOrdered))
   if (params?.sellerFill) searchParams.append('seller_fill', params.sellerFill)
   if (params?.hasDetail !== undefined) searchParams.append('has_detail', String(params.hasDetail))
+  if (params?.dmState) searchParams.append('dm_state', params.dmState)
+  if (params?.orderState) searchParams.append('order_state', params.orderState)
+  if (params?.createdStart) searchParams.append('created_start', params.createdStart)
+  if (params?.createdEnd) searchParams.append('created_end', params.createdEnd)
   return get(`${PREFIX}/items?${searchParams.toString()}`)
 }
 

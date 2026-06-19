@@ -80,6 +80,9 @@ class SolveCaptchaRequest(BaseModel):
     browser_timeout: int = 40     # 单次浏览器超时（秒）
     call_type: str = "remote"     # 调用类型：local-本机 / remote-远程
     call_user: str | None = None  # 调用用户（远程调用按秘钥查到的用户名）
+    cookies: str = ""             # 可选：账号 Cookie（调用方开启"传递Cookie"开关时传入）。
+                                  # 传入后链接过期时可凭此 Cookie 重取新链接继续处理。
+    device_id: str = ""           # 可选：设备 ID，配合 cookies 重新请求 token 接口使用
 
 
 @router.post("/logs/retention")
@@ -245,6 +248,11 @@ async def restart_account(account_id: str, request: StartAccountRequest = None):
         if request is None:
             request = StartAccountRequest()
 
+        # 实际用于启动任务的 Cookie 与所属用户：
+        # 优先用请求携带的值，未携带时回退数据库（避免重启时把空 Cookie 传给任务导致"未提供cookies"）
+        cookie_str = request.cookie_value
+        resolved_user_id = request.user_id
+
         # 重启前清除Token缓存，确保重新获取Token和完整Cookie
         # 注意：xy_token_cache.user_id 存的是闲鱼的 unb（myid），不是 cookie_id(account_id)
         # 因此必须先从 Cookie 中解析出 unb 再作为 user_id 参数删除
@@ -254,18 +262,19 @@ async def restart_account(account_id: str, request: StartAccountRequest = None):
             from common.utils.xianyu_utils import trans_cookies
             from sqlalchemy import text
 
-            # 1) 优先用请求携带的 cookie_value，其次回退数据库查询
-            cookie_str = request.cookie_value
+            # 1) 请求未携带 Cookie 时，回退数据库查询（同时取账号归属用户）
             if not cookie_str:
                 try:
                     account = await get_account_by_identity(
                         account_id,
                         owner_id=request.user_id,
                     )
-                    cookie_str = account.cookie if account else None
+                    if account:
+                        cookie_str = account.cookie
+                        if resolved_user_id is None:
+                            resolved_user_id = account.owner_id
                 except Exception as query_e:
-                    logger.warning(f"查询账号Cookie用于清除Token缓存失败: {query_e}")
-                    cookie_str = None
+                    logger.warning(f"查询账号Cookie失败: {query_e}")
 
             # 2) 解析 unb
             unb = ""
@@ -294,11 +303,11 @@ async def restart_account(account_id: str, request: StartAccountRequest = None):
         manager = get_manager()
         # 先停止
         manager.remove_cookie(account_id)
-        # 再启动
+        # 再启动（使用解析后的 Cookie 与归属用户，避免空 Cookie 启动失败）
         manager.add_cookie(
             cookie_id=account_id,
-            cookie_value=request.cookie_value,
-            user_id=request.user_id
+            cookie_value=cookie_str,
+            user_id=resolved_user_id
         )
         logger.info(f"账号任务重启成功: {account_id}")
         
@@ -377,11 +386,38 @@ async def solve_captcha(request: SolveCaptchaRequest):
         from app.services.captcha.slider_stealth import run_slider_verification_with_fallback
         from common.services.captcha.concurrency import run_browser_task
 
-        # enable_learning=True, headless=False, existing_cookies_str="", url_provider=None
-        # 不传 cookies / url_provider：链接过期或失败时直接判失败（符合模式B“失败即返回失败”）
+        # 若调用方传入了账号 Cookie（开启了"传递Cookie"开关）：
+        #   - 把 Cookie 作为 existing_cookies_str 提供给兜底引擎注入；
+        #   - 构造 url_provider，遇到"抱歉，页面访问出现了问题"（链接过期）时凭 Cookie 重取新链接，
+        #     与本机处理滑块的逻辑保持一致。
+        # 未传 Cookie 时保持原模式B：链接过期或失败直接判失败（cookies="" / url_provider=None）。
+        existing_cookies_str = (request.cookies or "").strip()
+        device_id = (request.device_id or "").strip()
+        url_provider = None
+        if existing_cookies_str:
+            from common.services.captcha.token_refetch import request_fresh_captcha_url
+            from app.services.captcha.slider_stealth import CAPTCHA_NOT_REQUIRED
+            from common.utils.xianyu_utils import trans_cookies
+
+            try:
+                _cookies_dict = trans_cookies(existing_cookies_str)
+            except Exception:
+                _cookies_dict = {}
+
+            def _remote_url_provider():
+                """凭传入的 Cookie 重新请求 token 接口，拿到新鲜验证链接（远程端链接过期兜底）。"""
+                res = request_fresh_captcha_url(safe_id, _cookies_dict, existing_cookies_str, device_id)
+                if res.get("token_ok"):
+                    # 风控已解除、无需滑块：返回哨兵，让上层提前结束滑块流程
+                    return CAPTCHA_NOT_REQUIRED
+                return res.get("fresh_url")
+
+            url_provider = _remote_url_provider
+            logger.info(f"【过滑块接口】account_id={safe_id} 已携带 Cookie，启用链接过期自动重取")
+
         success, cookies, engine = await run_browser_task(
             run_slider_verification_with_fallback,
-            safe_id, url, True, False, timeout, "", None,
+            safe_id, url, True, False, timeout, existing_cookies_str, url_provider,
         )
     except Exception as e:
         logger.error(f"【过滑块接口】account_id={safe_id} 执行异常: {e}")
