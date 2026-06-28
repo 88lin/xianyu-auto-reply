@@ -115,6 +115,7 @@ async def list_listing_monitor_tasks(
     page_size: int = Query(20, description="每页条数"),
     keyword: Optional[str] = Query(None, description="按关键字筛选"),
     is_enabled: Optional[bool] = Query(None, description="是否启用"),
+    category_id: Optional[int] = Query(None, description="按分类筛选"),
     current_user: User = Depends(get_current_active_user),
     session: AsyncSession = Depends(get_db_session),
 ) -> Dict[str, Any]:
@@ -127,6 +128,7 @@ async def list_listing_monitor_tasks(
         page_size=page_size,
         keyword=keyword,
         is_enabled=is_enabled,
+        category_id=category_id,
     )
     return ApiResponse(success=True, message="查询成功", data=data)
 
@@ -368,7 +370,7 @@ async def list_listing_monitor_items(
     is_ordered: Optional[bool] = Query(None, description="是否已下单"),
     seller_fill: Optional[str] = Query(None, description="卖家补全状态：filled/pending/failed"),
     has_detail: Optional[bool] = Query(None, description="是否已获取详情"),
-    dm_state: Optional[str] = Query(None, description="私信状态：not_sent/pending/success/failed"),
+    dm_state: Optional[str] = Query(None, description="私信状态：not_sent/waiting/pending/success/failed"),
     order_state: Optional[str] = Query(None, description="下单状态：not_ordered/ordered/failed/no_account/duplicate"),
     created_start: Optional[str] = Query(None, description="采集时间区间开始（北京时间，如 2026-06-18T00:00）"),
     created_end: Optional[str] = Query(None, description="采集时间区间结束（北京时间，如 2026-06-18T23:59）"),

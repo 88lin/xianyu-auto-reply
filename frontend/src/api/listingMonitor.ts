@@ -114,6 +114,7 @@ export const getListingMonitorTasks = (
   params?: {
     keyword?: string
     isEnabled?: boolean
+    categoryId?: number
   }
 ): Promise<ApiResponse<ListingMonitorTaskListData>> => {
   const searchParams = new URLSearchParams({
@@ -122,6 +123,7 @@ export const getListingMonitorTasks = (
   })
   if (params?.keyword) searchParams.append('keyword', params.keyword)
   if (params?.isEnabled !== undefined) searchParams.append('is_enabled', String(params.isEnabled))
+  if (params?.categoryId !== undefined) searchParams.append('category_id', String(params.categoryId))
   return get(`${PREFIX}?${searchParams.toString()}`)
 }
 
@@ -283,9 +285,11 @@ export interface ListingMonitorItem {
   dm_attempts?: number
   is_ordered: boolean
   order_id?: string | null
+  order_account_id?: string | null
   order_status?: string | null
   order_fail_reason?: string | null
   order_attempts?: number
+  ordered_at?: string | null
   last_seen_at?: string | null
   created_at?: string | null
   updated_at?: string | null
