@@ -75,6 +75,8 @@ except ImportError:
 _PUNISH = ("punish", "x5step=2", "action=captcha", "pureCaptcha", "/captcha")
 _MAX_ANCHOR_GAP_MS = 180.0
 _MAX_REPLAY_DURATION_MS = 2600.0
+_BUSINESS_SEGMENT_GAP_MS = 500.0
+_PREFERRED_BUSINESS_TRAIL = "human_trail_pass_1784203585.json"
 # 真人鼠标模式专用固定目录：本地与远程请求共用，用于复用和精确识别 Chrome 进程。
 _REAL_MOUSE_BROWSER_DIR = os.path.abspath(
     os.path.join(os.path.dirname(__file__), "..", "..", "..", "browser_data", "real_mouse_shared")
@@ -129,6 +131,32 @@ def _detect_scene(url: str) -> str:
     return "login" if "/newlogin/login.do" in (url or "") else "business"
 
 
+def _extract_business_drag(trail: list) -> list:
+    """切分业务轨迹中的多次按下操作，返回正向位移最大的拖动段。"""
+    segments: List[list] = []
+    current: list = []
+    for event in trail:
+        if not isinstance(event, list) or len(event) < 5:
+            continue
+        event_type = event[0]
+        if event_type in ("mousemove", "pointermove") and event[4] == 1:
+            if current and event[3] - current[-1][3] > _BUSINESS_SEGMENT_GAP_MS:
+                segments.append(current)
+                current = []
+            current.append(event)
+            continue
+        if current and event_type in (
+            "mousemove", "pointermove", "mouseup", "pointerup"
+        ):
+            segments.append(current)
+            current = []
+    if current:
+        segments.append(current)
+
+    forward = [segment for segment in segments if segment[-1][1] - segment[0][1] > 5]
+    return max(forward, key=lambda segment: segment[-1][1] - segment[0][1], default=[])
+
+
 def _load_drags(scene: str = "business") -> List[List[Tuple[float, float, float]]]:
     """加载真人通过轨迹，提取「按下拖动段」为相对位移序列 [(dx, dy, dt_ms), ...]。
 
@@ -137,8 +165,20 @@ def _load_drags(scene: str = "business") -> List[List[Tuple[float, float, float]
                或 "login"（登录滑块，样本 human_trail_login_*.json，长位移）
     """
     pattern = "human_trail_login_*.json" if scene == "login" else "human_trail_pass_*.json"
+    files = sorted(glob.glob(os.path.join(_trails_dir(), pattern)))
+    preferred: Optional[str] = None
+    if scene == "business":
+        preferred_path = os.path.join(_trails_dir(), _PREFERRED_BUSINESS_TRAIL)
+        if os.path.isfile(preferred_path):
+            preferred = preferred_path
+            files = [preferred] + [f for f in files if f != preferred]
+        else:
+            logger.warning(
+                f"业务优选真人轨迹不存在，回退全部业务样本: {_PREFERRED_BUSINESS_TRAIL}"
+            )
     drags: List[List[Tuple[float, float, float]]] = []
-    for f in sorted(glob.glob(os.path.join(_trails_dir(), pattern))):
+    preferred_drag: Optional[List[Tuple[float, float, float]]] = None
+    for f in files:
         try:
             if scene == "login":
                 data = json.load(open(f, encoding="utf-8"))
@@ -151,9 +191,12 @@ def _load_drags(scene: str = "business") -> List[List[Tuple[float, float, float]
         except Exception as e:
             logger.warning(f"加载真人轨迹失败 {f}: {e}")
             continue
-        # 登录与业务滑块共用同一套拖动段提取逻辑，仅样本文件不同。
-        moves = [e for e in trail if isinstance(e, list) and len(e) >= 5 and e[0] == "mousemove"]
-        seg = [e for e in moves if len(e) >= 5 and e[4] == 1]
+        if scene == "business":
+            seg = _extract_business_drag(trail)
+        else:
+            # 登录滑块保持原有提取方式，不改变登录专用长轨迹行为。
+            moves = [e for e in trail if isinstance(e, list) and len(e) >= 5 and e[0] == "mousemove"]
+            seg = [e for e in moves if len(e) >= 5 and e[4] == 1]
         if len(seg) < 5:
             continue
         if scene == "business":
@@ -184,6 +227,14 @@ def _load_drags(scene: str = "business") -> List[List[Tuple[float, float, float]
             if distance < 120 or distance > 1200:
                 continue
         drags.append(rel)
+        if preferred and f == preferred:
+            preferred_drag = rel
+    if scene == "business" and preferred:
+        if preferred_drag is not None:
+            return [preferred_drag]
+        logger.warning(
+            f"业务优选真人轨迹无效，回退其他业务样本: {_PREFERRED_BUSINESS_TRAIL}"
+        )
     return drags
 
 
@@ -213,6 +264,47 @@ def _choose_drag(drags: List[List[Tuple[float, float, float]]]) -> List[Tuple[fl
             continue
         weights.append(1.0 + min(points, 80) / 25.0 + min(duration_ms, 1800) / 900.0)
     return random.choices(drags, weights=weights, k=1)[0]
+
+
+def _calculate_business_distance(frame, btn, track) -> float:
+    """计算业务滑块的实际可移动距离，优先使用 frame 内的精确 DOM 尺寸。"""
+    try:
+        distance = frame.evaluate(
+            """() => {
+                const button = document.querySelector('#nc_1_n1z');
+                const track = document.querySelector('#nc_1_n1t') || document.querySelector('.nc_scale');
+                if (!button || !track) return null;
+                return track.getBoundingClientRect().width - button.getBoundingClientRect().width;
+            }"""
+        )
+        if distance and distance > 0:
+            return float(distance)
+    except Exception:
+        pass
+
+    try:
+        button_box = btn.bounding_box()
+        track_box = track.bounding_box()
+        if button_box and track_box:
+            distance = track_box["width"] - button_box["width"]
+            if distance > 0:
+                return float(distance)
+    except Exception:
+        pass
+    return 0.0
+
+
+def _scale_drag_to_distance(
+    drag: List[Tuple[float, float, float]],
+    distance: float,
+) -> List[Tuple[float, float, float]]:
+    """按当前滑块距离缩放 X 位移，保留真人 Y 轨迹与原始时序。"""
+    if not drag or distance <= 0 or drag[-1][0] <= 1:
+        return drag
+    factor = distance / drag[-1][0]
+    scaled = [(dx * factor, dy, dt) for dx, dy, dt in drag]
+    scaled[-1] = (distance, scaled[-1][1], scaled[-1][2])
+    return scaled
 
 
 class _RealMouseSolver:
@@ -621,7 +713,7 @@ class _RealMouseSolver:
                 )
             else:
                 logger.info(
-                    f"【{self.pure_id}】业务滑块第{attempt}次选用真人轨迹: "
+                    f"【{self.pure_id}】业务滑块第{attempt}次选用真人原始轨迹: "
                     f"点数={len(selected_drag)}, "
                     f"位移={selected_drag[-1][0]:.0f}px, "
                     f"时长={sum(point[2] for point in selected_drag):.0f}ms"
@@ -689,7 +781,18 @@ class _RealMouseSolver:
             return False
         mx = box["x"] + box["width"] / 2
         my = box["y"] + box["height"] / 2
-        if scene == "login":
+        if scene == "business":
+            source_distance = drag[-1][0] if drag else 0.0
+            target_distance = _calculate_business_distance(frame, btn, track)
+            if target_distance <= 0:
+                logger.warning(f"【{self.pure_id}】真实鼠标引擎无法计算业务滑块距离")
+                return False
+            drag = _scale_drag_to_distance(drag, target_distance)
+            logger.info(
+                f"【{self.pure_id}】业务滑块轨迹距离缩放: "
+                f"{source_distance:.1f}px -> {target_distance:.1f}px, 点数={len(drag)}"
+            )
+        else:
             track_box = track.bounding_box() if track else None
             if track_box:
                 candidate_x = track_box["x"] + track_box["width"] - 1 - drag[-1][0]
@@ -751,8 +854,11 @@ class _RealMouseSolver:
             # 业务滑块使用已验证的 SendInput + 精密时序：同帧内短间隔点背靠背发送，
             # 让 Chrome 产生接近真人硬件鼠标的 coalesced 子事件密度。
             timer_resolution(True)
-            send_button(True)
             try:
+                send_move_abs(sx, sy)
+                time.sleep(random.uniform(0.035, 0.055))
+                send_button(True)
+                send_move_abs(sx, sy)
                 time.sleep(random.uniform(0.065, 0.085))
                 started = time.perf_counter()
                 elapsed = 0.0
@@ -966,7 +1072,7 @@ def run_real_mouse_verification(
 
     Args:
         weight_class: 排队来源类别（"local"=本地Token刷新 / "remote"=远程无cookie /
-            "remote_cookie"=远程有cookie）。本地与远程按权重公平放行；远程内部无cookie 严格优先于有cookie。
+            "remote_cookie"=远程有cookie）。本地与远程按权重公平放行；远程内部默认无cookie优先，等待满70秒后按最早入队优先。
 
     Returns:
         (是否成功, x5* cookies 字典 | None)
