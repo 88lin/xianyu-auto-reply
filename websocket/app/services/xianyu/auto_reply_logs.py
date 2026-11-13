@@ -230,6 +230,7 @@ class AutoReplyLogsMixin:
         chat_id: str,
         send_user_id: str,
         text: str,
+        before_send=None,
     ) -> List[Dict[str, Any]]:
         """发送文本消息，支持 ###### 分隔符拆分为多条消息（参照旧框架）
         
@@ -238,6 +239,7 @@ class AutoReplyLogsMixin:
             chat_id: 会话ID
             send_user_id: 接收者用户ID
             text: 消息内容
+            before_send: 可选异步检查，每段实际发送前执行；失败停止后续发送。
         """
         send_results: List[Dict[str, Any]] = []
          
@@ -247,6 +249,8 @@ class AutoReplyLogsMixin:
             logger.info(f"【{self.cookie_id}】检测到分隔符，拆分为 {len(messages)} 条消息")
              
             for i, msg in enumerate(messages):
+                if before_send is not None:
+                    await before_send()
                 result = await self.xianyu_instance.send_msg(
                     websocket=websocket,
                     chat_id=chat_id,
@@ -261,6 +265,8 @@ class AutoReplyLogsMixin:
                     await asyncio.sleep(0.5)
         else:
             # 单条消息直接发送
+            if before_send is not None:
+                await before_send()
             result = await self.xianyu_instance.send_msg(
                 websocket=websocket,
                 chat_id=chat_id,
@@ -294,7 +300,8 @@ class AutoReplyLogsMixin:
         try:
             
             # 获取账号的通知配置(使用get_account_notifications方法)
-            notifications = db_manager.get_account_notifications(self.cookie_id)
+            # 这里只发聊天消息，必须带上类型，否则只订阅「账号状态」的渠道也会被聊天刷屏
+            notifications = db_manager.get_account_notifications(self.cookie_id, notify_type='chat')
             if not notifications:
                 logger.info(f"【{self.cookie_id}】未配置消息通知，跳过通知发送")
                 return
