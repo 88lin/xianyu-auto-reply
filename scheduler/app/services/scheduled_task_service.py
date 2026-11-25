@@ -16,6 +16,8 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from common.models.scheduled_task import ScheduledTask
+from common.models.security_task import SECURITY_INTERVAL_SECONDS, SECURITY_TASK_CODE
+from common.services.scheduled_task_config_service import update_scheduled_task
 
 
 # 任务代码常量
@@ -47,6 +49,7 @@ TASK_CODE_SCHEDULED_PUBLISH = "scheduled_publish"
 
 # 默认配置（数据库无配置时使用）
 DEFAULT_CONFIGS = {
+    SECURITY_TASK_CODE: {'interval_seconds': SECURITY_INTERVAL_SECONDS, 'enabled': False},
     TASK_CODE_REDELIVERY: {"interval_seconds": 5, "enabled": True},
     TASK_CODE_RATE: {"interval_seconds": 20, "enabled": True},
     TASK_CODE_POLISH: {"interval_seconds": 60, "enabled": True},
@@ -114,7 +117,7 @@ class ScheduledTaskService:
                     "interval_seconds": task.interval_seconds,
                     "enabled": task.enabled,
                 }
-                # 更新缓存
+                # 所有任务共用原配置缓存和日志流程。
                 self._config_cache[task_code] = config
                 logger.info(
                     f"[定时任务配置] 加载任务配置 {task_code}: "
@@ -171,16 +174,9 @@ class ScheduledTaskService:
             logger.warning(f"[定时任务配置] 任务不存在: {task_code}")
             return None
         
-        # 更新字段
-        if interval_seconds is not None:
-            if interval_seconds < 1:
-                raise ValueError("执行间隔不能小于1秒")
-            task.interval_seconds = interval_seconds
-        
-        if enabled is not None:
-            task.enabled = enabled
-        
+        # 各管理入口共用同一配置保存及锁顺序，不另建安全任务开关。
         await self.session.commit()
+        await update_scheduled_task(task_code, interval_seconds, enabled)
         await self.session.refresh(task)
         
         logger.info(

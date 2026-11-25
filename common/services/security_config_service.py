@@ -4,9 +4,16 @@ from __future__ import annotations
 from sqlalchemy import select, update
 
 from common.db.idempotent_insert import insert_defaults
-from common.models.security_task import SECURITY_INTERVAL_SECONDS, SECURITY_TASK_CODE, SecurityTask
+from common.models.security_task import (
+    SECURITY_INTERVAL_SECONDS,
+    SECURITY_TASK_CODE,
+    SecurityTask,
+)
 from common.models.system_setting import SystemSetting
-from common.services.auth_security_policy import AUTH_SECURITY_DEFAULTS, AUTH_SECURITY_GROUP
+from common.services.auth_security_policy import (
+    AUTH_SECURITY_DEFAULTS,
+    AUTH_SECURITY_GROUP,
+)
 from common.utils.time_utils import get_beijing_now_naive
 
 
@@ -27,7 +34,7 @@ async def ensure_security_defaults(connection) -> None:
     now = get_beijing_now_naive()
     await insert_defaults(connection, SecurityTask.__table__, {
         'task_code': SECURITY_TASK_CODE, 'interval_seconds': SECURITY_INTERVAL_SECONDS, 'config_version': 0,
-        'next_run_at': now, 'created_at': now, 'updated_at': now,
+        'enabled': False, 'next_run_at': None, 'created_at': now, 'updated_at': now,
     }, ('task_code',))
     for key, (value, description) in AUTH_SECURITY_DEFAULTS.items():
         await insert_defaults(connection, SystemSetting.__table__, {

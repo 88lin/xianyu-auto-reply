@@ -9,17 +9,27 @@ from uuid import uuid4
 
 from common.models.security_log import SecurityLog
 from common.models.security_task import (
-    SECURITY_INTERVAL_SECONDS, SECURITY_LEASE_SECONDS, SECURITY_METHODS,
+    SECURITY_LEASE_SECONDS,
+    SECURITY_METHODS,
     SECURITY_SCAN_TIMEOUT_SECONDS,
 )
 from common.services.audit_writer import AuditWriteError, AuditWriter, report_safely
 from common.services.auth_security_policy import (
-    AUTH_DENIED_IPS_KEY, AUTH_FREQUENCY_KEYS, AUTH_SECURITY_DEFAULTS,
+    AUTH_DENIED_IPS_KEY,
+    AUTH_FREQUENCY_KEYS,
+    AUTH_SECURITY_DEFAULTS,
     normalize_security_setting,
 )
 from common.services.email_domain_policy import EMAIL_DOMAIN_DENY_KEY
-from common.services.security_config_service import load_security_values_locked, lock_security_task, save_security_values
-from common.services.security_frequency_stats import collect_statistics, initialize_statistics
+from common.services.security_config_service import (
+    load_security_values_locked,
+    lock_security_task,
+    save_security_values,
+)
+from common.services.security_frequency_stats import (
+    collect_statistics,
+    initialize_statistics,
+)
 from common.utils.async_cleanup import complete_before_cancellation
 from common.utils.time_utils import get_beijing_now_naive
 
@@ -41,6 +51,8 @@ class SecurityFrequencyService:
         """注册执行生命周期；请求取消仍等待执行和审计完成，关闭后拒绝新任务。"""
         if method not in SECURITY_METHODS or (method == 'manual' and owner_id is None):
             raise ValueError('安全检查执行方式或管理员信息无效')
+        if method == 'manual' and (type(owner_id) is not int or owner_id <= 0):
+            raise ValueError('安全检查管理员信息无效')
         if self.closing:
             raise SecurityExecutionError('系统正在关闭，请稍后执行安全检查')
         worker = asyncio.create_task(self._execute(method, owner_id if method == 'manual' else None))
@@ -70,12 +82,10 @@ class SecurityFrequencyService:
                    'candidate_suffixes': [], 'candidate_ips': [], 'windows': []}
 
         async def claim(session):
-            """行锁下检查本轮占用与真实到期时间，不覆盖活跃执行。"""
+            """行锁下防止业务扫描重叠；执行间隔与启停由原调度器统一管理。"""
             task = await lock_security_task(session)
             now = get_beijing_now_naive()
             if task.lease_id and task.lease_expires_at and task.lease_expires_at > now:
-                return False
-            if method == 'auto' and task.next_run_at and task.next_run_at > now:
                 return False
             task.lease_id, task.lease_expires_at = execution_id, now + timedelta(seconds=SECURITY_LEASE_SECONDS)
             return True
@@ -108,7 +118,7 @@ class SecurityFrequencyService:
             await prepare(session)
 
         async def run(session):
-            """扫描超时回滚全部写入；日志、实际新增名单和下次执行同事务提交。"""
+            """扫描超时回滚全部写入；日志、实际新增名单和业务结果同事务提交。"""
             async with asyncio.timeout(SECURITY_SCAN_TIMEOUT_SECONDS):
                 raw = await load_security_values_locked(session)
                 details['settings_snapshot'] = dict(raw)
@@ -158,7 +168,7 @@ class SecurityFrequencyService:
         return response
 
     async def _save_failure(self, prepare, state, details, execution_id, owner_id, method, started_at, exc):
-        """业务回滚后独立会话重新取锁，失败日志和释放占用/调度同事务提交。"""
+        """业务回滚后独立会话重新取锁，失败日志和释放业务占用同事务提交。"""
         details['error'] = {'type': type(exc).__name__, 'message': str(exc),
                             'traceback': ''.join(traceback.format_exception(exc))}
         file_error = report_safely('安全检查失败 ' + json.dumps(details, ensure_ascii=False), exc)
@@ -183,7 +193,7 @@ class SecurityFrequencyService:
 
     async def _append_result(self, session, task, details, execution_id, owner_id, method,
                              result, message, suffixes, ips, started_at) -> dict:
-        """构造只追加审计并更新调度，同一事务提交后才向调用方返回。"""
+        """追加审计并保存真实业务结果，同一事务提交后才向调用方返回。"""
         finished = get_beijing_now_naive()
         details['finished_at'] = finished.isoformat()
         record = SecurityLog(execution_id=execution_id, owner_id=owner_id, execution_method=method,
@@ -191,7 +201,6 @@ class SecurityFrequencyService:
                              added_ips=','.join(ips), details=json.dumps(details, ensure_ascii=False),
                              started_at=started_at, finished_at=finished)
         session.add(record)
-        task.next_run_at = finished + timedelta(seconds=SECURITY_INTERVAL_SECONDS)
         task.last_run_at, task.last_result, task.last_message = started_at, result, message
         task.lease_id = task.lease_expires_at = None
         task.updated_at = finished

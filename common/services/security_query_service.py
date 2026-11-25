@@ -2,16 +2,20 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime, time
 
 from sqlalchemy import or_, select
 
 from common.models.data_dictionary import XYDataDictionary
+from common.models.scheduled_task import ScheduledTask
 from common.models.security_log import SecurityLog
 from common.models.security_task import (
-    SECURITY_DICTIONARIES, SECURITY_INTERVAL_SECONDS, SECURITY_METHODS, SECURITY_RESULTS, SecurityTask,
+    SECURITY_DICTIONARIES,
+    SECURITY_METHODS,
+    SECURITY_RESULTS,
+    SECURITY_TASK_CODE,
+    SecurityTask,
 )
-from common.services.registration_log_query_service import _parse_date
+from common.utils.date_filters import date_range_conditions
 from common.utils.pagination import execute_paginated_with_filters
 from common.utils.time_utils import get_beijing_now_naive, safe_isoformat
 
@@ -53,13 +57,7 @@ class SecurityQueryService:
             filters.append(SecurityLog.execution_method == execution_method)
         if result:
             filters.append(SecurityLog.result == result)
-        start, end = _parse_date(start_date, '开始日期'), _parse_date(end_date, '结束日期')
-        if start and end and start > end:
-            raise ValueError('开始日期不能晚于结束日期')
-        if start:
-            filters.append(SecurityLog.started_at >= start)
-        if end:
-            filters.append(SecurityLog.started_at <= datetime.combine(end.date(), time.max))
+        filters.extend(date_range_conditions(SecurityLog.started_at, start_date, end_date))
         rows, total = await execute_paginated_with_filters(self.session, SecurityLog, filters=filters,
             order_by=[SecurityLog.started_at.desc(), SecurityLog.id.desc()], page=page, page_size=page_size)
         return {'items': [self.serialize_log(item) for item in rows], 'total': total, 'page': page,
@@ -83,17 +81,28 @@ class SecurityQueryService:
         """展示真实下次执行、上次结果及占用，不影响插件自有调度。"""
         self.validate_pagination(page, page_size)
         rows, total = await execute_paginated_with_filters(self.session, SecurityTask,
-            order_by=[SecurityTask.id], page=page, page_size=page_size)
+            filters=[SecurityTask.task_code == SECURITY_TASK_CODE], order_by=[SecurityTask.id], page=page, page_size=page_size)
+        schedule = (await self.session.execute(select(ScheduledTask).where(
+            ScheduledTask.task_code == SECURITY_TASK_CODE))).scalar_one_or_none()
+        if schedule is None:
+            raise RuntimeError('安全频率限制未接入原定时任务表，请检查启动自检结果')
+        return {'items': [self.serialize_task(row, schedule) for row in rows], 'total': total, 'page': page, 'page_size': page_size,
+            'pages': (total + page_size - 1) // page_size, 'dictionaries': await self.dictionaries()}
+
+    @staticmethod
+    def serialize_task(row: SecurityTask, schedule: ScheduledTask) -> dict:
+        """统一序列化安全任务原始调度状态，供原定时任务列表与兼容接口复用。"""
         now = get_beijing_now_naive()
-        return {'items': [{
-            # 运行间隔来自执行器统一常量；旧表NULL或遗留值不能伪装成当前真实调度间隔。
-            'id': row.id, 'task_code': row.task_code, 'interval_seconds': SECURITY_INTERVAL_SECONDS,
-            'next_run_at': safe_isoformat(row.next_run_at), 'last_run_at': safe_isoformat(row.last_run_at),
+        return {
+            'id': schedule.id, 'task_code': schedule.task_code, 'interval_seconds': schedule.interval_seconds,
+            'enabled': bool(schedule.enabled),
+            # 兼容旧字段；原调度器采用间隔循环，旧持久化时间不再是运行来源。
+            'next_run_at': None,
+            'last_run_at': safe_isoformat(row.last_run_at),
             'last_result': row.last_result, 'last_message': row.last_message,
             'running': bool(row.lease_id and row.lease_expires_at and row.lease_expires_at > now),
             'execution_id': row.lease_id, 'lease_expires_at': safe_isoformat(row.lease_expires_at),
-        } for row in rows], 'total': total, 'page': page, 'page_size': page_size,
-            'pages': (total + page_size - 1) // page_size, 'dictionaries': await self.dictionaries()}
+        }
 
     @staticmethod
     def validate_pagination(page: int, page_size: int) -> None:
